@@ -1,0 +1,6 @@
+[theme]
+primaryColor = "#FF5722"  # Laranja "Industrial" (Botões e Barras de carregamento)
+backgroundColor = "#FFFFFF" # Fundo Branco limpo
+secondaryBackgroundColor = "#E6E8E1" # Cinza Concreto (Barra lateral)
+textColor = "#31333F" # Texto Cinza Chumbo (Leitura fácil)
+font = "sans serif"
