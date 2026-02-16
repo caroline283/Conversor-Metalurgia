@@ -3,18 +3,19 @@ import pandas as pd
 import pdfplumber
 import re
 import io
+from streamlit_gsheets import GSheetsConnection
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Metalurgia Calc System V3", layout="wide", page_icon="🏗️")
 
-# --- 1. GERENCIAMENTO DE ESTADO ---
-# Inicializa as variáveis se não existirem
-if 'df_dados' not in st.session_state:
-    st.session_state.df_dados = pd.DataFrame()
+# --- 0. CONEXÃO COM GOOGLE SHEETS ---
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Estrutura inicial das regras (Baseada nos seus arquivos)
-if 'db_mapeamento' not in st.session_state:
-    st.session_state.db_mapeamento = pd.DataFrame([
+# --- 1. GERENCIAMENTO DE ESTADO E CARREGAMENTO ---
+# Função para carregar dados da nuvem ou usar padrão se falhar
+def carregar_dados_iniciais():
+    # Dados Padrão (Fallback)
+    default_mapeamento = pd.DataFrame([
         {'texto_contido': 'CONFIGURAÇÃO DO MÓDULO', 'tipo': 'IGNORAR'},
         {'texto_contido': 'Capa do pé condutor 330', 'tipo': 'IGNORAR'},
         {'texto_contido': 'Leito metálico 920 Bate Forte', 'tipo': 'CONJUNTO'},
@@ -25,59 +26,62 @@ if 'db_mapeamento' not in st.session_state:
         {'texto_contido': 'CHAPA', 'tipo': 'CH_PLANA'},
         {'texto_contido': 'Chapa 3mm', 'tipo': 'CH_PLANA'},
     ])
-
-if 'db_pesos_metro' not in st.session_state:
-    st.session_state.db_pesos_metro = pd.DataFrame([
+    default_pesos_metro = pd.DataFrame([
         {'secao': '50x20', 'peso_kg_m': 1.2638},
         {'secao': '25x25', 'peso_kg_m': 0.887},
         {'secao': '20x20', 'peso_kg_m': 0.7533},
         {'secao': '100x100', 'peso_kg_m': 6.275},
         {'secao': '50x50', 'peso_kg_m': 2.2691},
     ])
-
-if 'db_pesos_conjunto' not in st.session_state:
-    st.session_state.db_pesos_conjunto = pd.DataFrame([
+    default_pesos_conjunto = pd.DataFrame([
         {'nome_conjunto': 'Leito metálico 920 Bate Forte', 'peso_unit_kg': 2.5},
         {'nome_conjunto': 'Pé Condutor 330 para mesas com estrutura metálica', 'peso_unit_kg': 12.0},
     ])
 
-# --- 2. FUNÇÕES AUXILIARES ---
-def carregar_excel_regras(uploaded_file):
+    # Tenta carregar do Google Sheets
     try:
-        xls = pd.ExcelFile(uploaded_file)
-        if 'MAPEAMENTO_TIPO' in xls.sheet_names:
-            st.session_state.db_mapeamento = pd.read_excel(xls, 'MAPEAMENTO_TIPO')
-        if 'PESO_POR_METRO' in xls.sheet_names:
-            st.session_state.db_pesos_metro = pd.read_excel(xls, 'PESO_POR_METRO')
-        if 'PESO_CONJUNTO' in xls.sheet_names:
-            st.session_state.db_pesos_conjunto = pd.read_excel(xls, 'PESO_CONJUNTO')
-        st.success("Base de dados atualizada com sucesso!")
-    except Exception as e:
-        st.error(f"Erro ao ler arquivo: {e}")
+        # Tenta ler as abas. Se a planilha for nova, vai dar erro e cair no 'except'
+        df_map = conn.read(worksheet="MAPEAMENTO_TIPO", ttl=5)
+        df_metro = conn.read(worksheet="PESO_POR_METRO", ttl=5)
+        df_conj = conn.read(worksheet="PESO_CONJUNTO", ttl=5)
+        
+        # Se leitura funcionou, atualiza o session_state
+        if 'db_mapeamento' not in st.session_state: st.session_state.db_mapeamento = df_map
+        if 'db_pesos_metro' not in st.session_state: st.session_state.db_pesos_metro = df_metro
+        if 'db_pesos_conjunto' not in st.session_state: st.session_state.db_pesos_conjunto = df_conj
+        
+    except Exception:
+        # Se der erro (planilha vazia), usa os padrões
+        if 'db_mapeamento' not in st.session_state: st.session_state.db_mapeamento = default_mapeamento
+        if 'db_pesos_metro' not in st.session_state: st.session_state.db_pesos_metro = default_pesos_metro
+        if 'db_pesos_conjunto' not in st.session_state: st.session_state.db_pesos_conjunto = default_pesos_conjunto
 
-def gerar_excel_base():
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        st.session_state.db_mapeamento.to_excel(writer, sheet_name='MAPEAMENTO_TIPO', index=False)
-        st.session_state.db_pesos_metro.to_excel(writer, sheet_name='PESO_POR_METRO', index=False)
-        st.session_state.db_pesos_conjunto.to_excel(writer, sheet_name='PESO_CONJUNTO', index=False)
-        # Aba extra de parametros
-        pd.DataFrame([{'parametro': 'densidade_aco', 'valor': 7.85}]).to_excel(writer, sheet_name='PARAMETROS', index=False)
-    return output.getvalue()
+# Executa o carregamento inicial
+carregar_dados_iniciais()
+
+if 'df_dados' not in st.session_state:
+    st.session_state.df_dados = pd.DataFrame()
+
+# --- 2. FUNÇÕES AUXILIARES ---
+def salvar_na_nuvem():
+    try:
+        with st.spinner("Salvando dados no Google Sheets..."):
+            conn.update(worksheet="MAPEAMENTO_TIPO", data=st.session_state.db_mapeamento)
+            conn.update(worksheet="PESO_POR_METRO", data=st.session_state.db_pesos_metro)
+            conn.update(worksheet="PESO_CONJUNTO", data=st.session_state.db_pesos_conjunto)
+        st.success("✅ Dados salvos na nuvem com sucesso! Todos os usuários verão as mudanças.")
+    except Exception as e:
+        st.error(f"Erro ao salvar: {e}")
 
 # --- 3. MOTOR DE CÁLCULO ---
 def calcular_final(df_input):
-    # Converte DataFrames de configuração para Dicionários (para ficar rápido)
+    # Converte DataFrames de configuração para Dicionários
     map_rules = st.session_state.db_mapeamento.to_dict('records')
     
-    # Cria dicionário { '50x50': 2.26, ... }
     dict_metro = dict(zip(st.session_state.db_pesos_metro['secao'], st.session_state.db_pesos_metro['peso_kg_m']))
-    
-    # Cria dicionário { 'Nome Peça': 12.0, ... }
     dict_conjunto = dict(zip(st.session_state.db_pesos_conjunto['nome_conjunto'], st.session_state.db_pesos_conjunto['peso_unit_kg']))
     
     densidade = 7.85
-    
     resultados = []
     
     for _, row in df_input.iterrows():
@@ -109,7 +113,6 @@ def calcular_final(df_input):
 
         # Regra: CONJUNTO
         if tipo_final == 'CONJUNTO':
-            # Busca nome parcial
             for nome, peso in dict_conjunto.items():
                 if nome.upper() in desc.upper():
                     peso_unit = peso
@@ -149,7 +152,7 @@ def calcular_final(df_input):
 
 
 # --- 4. INTERFACE VISUAL (ABAS) ---
-st.title("🏭 Metalurgia System 3.0")
+st.title("🏭 Metalurgia System 3.0 (Cloud Connected)")
 
 aba_calc, aba_db = st.tabs(["📋 Calculadora de Pedidos", "🛠️ Editor da Base de Dados"])
 
@@ -161,7 +164,6 @@ with aba_calc:
     
     # Processamento do PDF
     if uploaded_pdf:
-        # Se for um arquivo novo (diferente do anterior), reprocessa
         if st.session_state.df_dados.empty:
             with st.spinner("Lendo PDF..."):
                 itens = []
@@ -200,7 +202,6 @@ with aba_calc:
             
             st.dataframe(df_res, use_container_width=True)
             
-            # Download Resultado
             buffer_res = io.BytesIO()
             with pd.ExcelWriter(buffer_res, engine='openpyxl') as writer:
                 df_res.to_excel(writer, index=False)
@@ -213,19 +214,13 @@ with aba_calc:
 
 # === ABA 2: EDITOR DA BASE DE DADOS ===
 with aba_db:
-    st.header("Gerenciar Regras de Cálculo")
-    st.markdown("Aqui você edita a inteligência do sistema. Todas as alterações são salvas instantaneamente para os próximos cálculos.")
+    st.header("Gerenciar Regras de Cálculo (Nuvem)")
+    st.info("💡 As alterações feitas aqui e salvas vão para o Google Sheets e aparecem para todos os usuários.")
     
-    col_import, col_export = st.columns(2)
-    with col_import:
-        up_db = st.file_uploader("Importar Base Excel (Sobrescreve tudo)", type="xlsx")
-        if up_db:
-            carregar_excel_regras(up_db)
-            
-    with col_export:
-        st.write("Salvar Base Atualizada:")
-        excel_data = gerar_excel_base()
-        st.download_button("💾 Baixar Base_Calculo_Final.xlsx", excel_data, "Base_Calculo_Peso_Metalurgia_FINAL.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    col_save, col_info = st.columns([1, 2])
+    with col_save:
+        if st.button("☁️ Salvar Alterações na Nuvem (Google Sheets)", type="primary"):
+            salvar_na_nuvem()
     
     st.markdown("---")
     
